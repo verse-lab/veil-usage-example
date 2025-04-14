@@ -62,13 +62,13 @@ as "y is between x and z".
     .---.---.
    /         \
   w           z
-  |           |      ring goes clockwise (i.e. w -> x -> y -> z -> w)
+  |           |      ring goes counter-clockwise (i.e. w -> x -> y -> z -> w)
   x           .
    \         /
     .---.---y
 
 The relation `btw x y z` means that `y` lies between `x` and `z` when traversing
-the ring clockwise, as shown in the diagram above.
+the ring counter-clockwise, as shown in the diagram above.
 
 The axioms are as follows:
 - [btw_ring] `∀ x y z, btw x y z → btw y z x`
@@ -76,7 +76,7 @@ The axioms are as follows:
 - [btw_side] `∀ w x y, btw w x y → ¬ btw w y x`
   - this encodes the fact that the ring is unidirectional: it is NOT the case
     that `y` is between `w` and `x` since that would entail going
-    counter-clockwise, which is not allowed
+    clockwise, which is not allowed
 - [btw_total] `∀ w x y, btw w x y ∨ btw w y x ∨ w = x ∨ w = y ∨ x = y`
 -/
 instantiate btwn : Between node
@@ -244,11 +244,15 @@ must run the `#gen_spec` command. -/
 set_option veil.printCounterexamples true
 set_option veil.smt.model.minimize true
 
+/- The `transition` VC style gives more readable counter-examples, since
+those show both the pre-state and post-state. -/
+set_option veil.vc_gen "transition"
+
 /- TIP: Press the pause (⏸) button in the Lean Infoview to "lock" the
 counter-example, so you can look at it while you type the `invariant` clause you
 want to add above. Then press play (▶) button to re-check the spec with the
 newly added invariant. -/
-#check_invariants_tr
+#check_invariants
 
 /-
 
@@ -299,9 +303,9 @@ We can repeat this process until we eliminate all CTIs and thus find an
 inductive invariant that establishes the safety of the system.
 -/
 
-/- TIP: you can run `#check_invariants_tr!` to see the theorem statements that
+/- TIP: you can run `#check_invariants!` to see the theorem statements that
 couldn't be proven. In this case: -/
--- #check_invariants_tr!
+-- #check_invariants!
 @[invProof]
   theorem recv_single_leader_ :
       ∀ (st st' : @State node),
@@ -309,10 +313,10 @@ couldn't be proven. In this case: -/
           (@System node node_dec node_ne tot btwn).inv st →
             (@Ring.recv.tr node node_dec node_ne tot btwn) st st' →
               (@Ring.single_leader node node_dec node_ne tot btwn) st' :=
-    by (unhygienic intros); solve_clause[Ring.recv.tr]
+    by (unhygienic intros); solve_clause[Ring.recv.tr] Ring.single_leader
 
-/- TIP: `#check_invariants_tr?` will print all theorems that will be checked. -/
--- #check_invariants_tr?
+/- TIP: `#check_invariants?` will print all theorems that will be checked. -/
+-- #check_invariants?
 
 /- Veil also provides facilities for interactively proving the safety of state
 transition systems, as shown below: -/
