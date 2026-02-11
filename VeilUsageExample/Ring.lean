@@ -36,12 +36,12 @@ its correctness automatically using SMT.
 -/
 
 /- This defines a new Veil module named `Ring`. In Lean terms, `Ring` is a
-`namespace` in which we have executed `open Classical`. -/
+`namespace`. -/
 veil module Ring
 
 /- This defines a new (uninterpreted) type `node`, to represent node IDs. The
 `type` command in Veil defines a Lean type that is sound to use as an SMT sort,
-i.e. one that comes with an instance of the `Nonempty` typeclass. -/
+i.e. one that comes with an instance of the `Inhabited` typeclass. -/
 type node
 
 /- This instantiates the `TotalOrder` class for `node`. You can right-click and
@@ -51,7 +51,6 @@ Concretely, it defines an (immutable) relation `tot.le` between nodes, and
 provides the standard reflexivity, transitivity, antisymmetry, and totality
 axioms for it. -/
 instantiate tot : TotalOrder node
-
 
 /- This instantiates the `Between` class for `node`. It encodes the fact that
 the `node`s form a (unidirectional) ring topology.
@@ -107,13 +106,12 @@ We model the state of this protocol as follows, with two (FOL) relations:
   NOTE: make sure you use `Prop` (`True` / `False`) in Veil rather than `bool`
   (`true` / `false`). You might see very confusing error messages if you use the
   latter. We are working on making this more user-friendly. -/
-relation leader : node → Prop
+relation leader : node → Bool
 -- alternative syntax: `relation leader (n : node)`
 
 -- `pending id dest = True` means there is a message containing node `id`'s ID
 -- that has been sent to (and can be received by) node `dest`
-relation pending (id : node) (dest : node)
-
+relation pending : node → node → Bool
 
 /- This declares an inductive datatype `Ring.State` that encodes the state of
 the Ring transition system / protocol. -/
@@ -121,17 +119,27 @@ the Ring transition system / protocol. -/
 
 /- We can inspect the generated datatype. This is a regular Lean definition
 (rather than a deeply-embedded object), so you can use it in any context you
-want within Lean. It corresponds to the following `structure` definition:
+want within Lean. It *corresponds* to the following `structure` definition:
 
 ```lean
 structure State (node : Type) where
   leader : node -> Prop
   pending : node -> node -> Prop
-deriving Nonempty
 ```
 
-Note that this type is parametric in the `node` type, which is a parameter (Lean
-`variable`) of the `Ring` module / namespace. -/
+In reality, it is more complicated, and looks like this:
+
+```lean
+structure Ring.State (χ : State.Label → Type) where
+  Ring.State.leader : χ State.Label.leader
+  Ring.State.pending : χ State.Label.pending
+```
+
+I.e., the actual types of the fields are parameterised by a type family `χ`
+from `State.Label`s (names of fields) to `Type`s. Veil supports different state
+representations to enable both efficient symbolic execution and efficient
+concrete execution (for `#model_check`, as you will see later).
+ -/
 #print State
 
 /- Veil's model of a specification is a state transition system. Having just
@@ -150,14 +158,11 @@ after_init {
   capital letters are universally quantified. This a convention we adopt from
   Ivy. For instance, `leader N := False` means that for all nodes `n`,
   `leader n = False`. -/
-  leader N := False
+  leader N := false
   /- `∀ m n, pending m n := False`
     or equivalently: `pending := fun M N => False` -/
-  pending M N := False
+  pending M N := false
 }
-
-#print initialState?
--- `fun st' => st' = { leader := fun N => False, pending := fun M N => False }`
 
 /-
 _Actions_ in Veil are imperative code fragments that modify the state. Veil
@@ -168,91 +173,122 @@ Here we define an action `send`, with parameters `n` and `next` of type `node`,
 that specifies what node `n` does when it initiates the protocol, i.e. it sends
 a message containing its own ID to its successor (`next`).
 -/
-action send (n next : node) = {
+action send (n next : node) {
   /- A `require` statement specifies a condition that must be satisfied for the
   action to take effect / trigger. Here we encode that `next` is indeed the
   successor of `n` in the ring. -/
   require n ≠ next ∧ ∀ Z, ((Z ≠ n ∧ Z ≠ next) → btw n next Z)
-  pending n next := True
+  pending n next := true
 }
-
-/- The `action` specification above produces a number of Lean definitions,
-including `send.tr`, which is the transition relation for the `send` action. -/
-#print send.tr
 
 /- Instead of "inlining" the condition for a node `next` to be the successor of
 `n` in all our actions, we can define a `ghost` `relation`, i.e. a derived
 relation defined in terms of the "real" state. (In this case, `isNext` does not
 in fact depend on the state, but it could.) -/
-ghost relation isNext (n next : node) :=
-  (n ≠ next) ∧ (∀ N', (N' ≠ n ∧ N' ≠ next) → ¬ btw n N' next)
+ghost relation isNext (n : node) (next : node) :=
+  ∀ Z, n ≠ next ∧ ((Z ≠ n ∧ Z ≠ next) → btw n next Z)
 
 #print isNext
 
-/- `n` receives a message containing `id`, and potentially forwards it to `next`. -/
-action recv (id n next : node) = {
+/- `n` receives a message containing `sender`, and potentially forwards it to `next`. -/
+action recv (sender n next : node) {
   require isNext n next
-  require pending id n
-  /- We use non-deterministic assignment to model that the message may or may
-  not be removed (i.e. it can potentially be received many times). -/
-  pending id n := *
+  require pending sender n
 
-  /- This is equivalent to the following Veil code:
-  ```lean
-  let isPresent ← fresh
-  pending id n := isPresent
-  ```
+  /- We can use non-deterministic assignment to model that the message may or
+  may not be removed (i.e. it can potentially be received many times). -/
+  let isPresent ← pick Bool
+  pending sender n := isPresent
 
-  Non-deterministic assignment is more general also lets us express things like
-  `pending ID N := *` (the entirety of the `pending` relation is now
-  indeterminate), i.e.:
-  ```lean
-  let newPending ← fresh
-  pending := newPending
-  ```
-  -/
+  /-
+    Non-deterministic assignment is more general also lets us express things like
+    `pending ID N := *` (the entirety of the `pending` relation is now
+    indeterminate), i.e.:
+    ```lean
+    let newPending ← pick (node → node → Bool)
+    pending := newPending
+    ```
+    -/
 
-  /- Veil `action`s are in fact an extended form of `do` notation, so you can
-  use standard Lean syntax and `do`-notation features like `let mut` in them -/
-  if (id = n) then
-    leader n := True
+  if (sender = n) then
+    leader n := true
   else
-    if (le n id) then
-      pending id next := True
+    if (le n sender) then
+      pending sender next := true
 }
-
-#print recv.tr
 
 /- This is the safety property we want to establish. `L1` and `L2` are
 implicitly universally quantified, i.e. this means:
 `∀ (L1 L2 : node), leader L1 ∧ leader L2 → L1 = L2` -/
-safety [single_leader] leader L1 ∧ leader L2 → L1 = L2
-#print single_leader
+safety [single_leader] leader N ∧ leader M → N = M
 
 /- These invariant clauses together with the safety property above form an
 inductive invariant. COMMENT THEM OUT to see how Veil can be used to manually
 discover invariants, guided by counterexamples to induction. -/
-
 invariant [leader_greatest] leader L → le N L
-invariant [receive_self_msg_only_if_greatest] pending L L → le N L
-invariant [no_bypass] pending S D ∧ btw S N D → le N S
+invariant [self_msg_greatest] pending L L → le N L
+invariant [drop_smaller] pending S D ∧ btw S N D → le N S
 
 /- Before we can operate on the specification in any way (e.g. check it), we
 must run the `#gen_spec` command. -/
 #gen_spec
 
-set_option veil.printCounterexamples true
-set_option veil.smt.model.minimize true
+/- We also support bounded model checking to validate the protocol. We use this
+especially to validate that our protocol specifications are non-vacuous, i.e.
+they do actually admit interesting executions.
 
-/- The `transition` VC style gives more readable counter-examples, since
-those show both the pre-state and post-state. -/
-set_option veil.vc_gen "transition"
+We have two forms of bounded model checking:
+
+  - Explicit-state model checking (like TLC), using `#model_check`. For this,
+  you need to provide concrete finite instantiations of the types used in the
+  specification. Here, we instantiate `node` as `Fin 4`, i.e. the finite type
+  with 4 elements: `{0, 1, 2, 3}`. This then *executes* the protocol, i.e.
+  enumerates all possible concrete traces of the protocol with 4 nodes, trying
+  to find an execution that violates the safety property or any of the
+  invariants (or has a failing `assert`).
+
+  - Symbolic model checking (like mypyvy), using `sat trace` or `unsat trace`,
+  explained below. This invokes an SMT solver to search for traces of a certain
+  shape.
+-/
+
+#model_check { node := Fin 4 }
+
+/- A trace specification consists of:
+- `sat`/`unsat` -- is the trace satisfiable?
+- `[an_optional_name]` -- the name of the trace; can be omitted
+- `{ ... }` -- the trace specification, consisting of:
+  - a sequence of actions, either explicitly listed or using `any action` or
+    `any N actions`
+  - `assert` statements to be checked against the state at that point in the
+    trace
+
+TIP: you can write `by` after the trace specification to Lean goal we are
+trying to prove is either satisfiable or unsatisfiable. This is quite verbose
+to enable Veil to reconstruct a trace it can display to you.
+-/
+
+/- This checks that there exists an initial state. -/
+sat trace [initial_state] {}
+
+sat trace {
+  any 3 actions
+  assert (∃ l, leader l)
+}
+
+unsat trace [cannot_receive_without_send] {
+  recv
+}
+
+unsat trace {
+  any 5 actions
+  assert (∃ n₁ n₂, n₁ ≠ n₂ ∧ leader n₁ ∧ leader n₂)
+}
 
 /- TIP: Press the pause (⏸) button in the Lean Infoview to "lock" the
 counter-example, so you can look at it while you type the `invariant` clause you
 want to add above. Then press play (▶) button to re-check the spec with the
 newly added invariant. -/
-#check_invariants
 
 /-
 
@@ -260,30 +296,27 @@ If you COMMENT OUT the `invariant` clauses above, you will see the following
 output. This shows that the `single_leader` invariant is not preserved by the
 `recv` action, i.e.
 
-Initialization must establish the invariant:
-  single_leader ... ✅
-The following set of actions must preserve the invariant:
-  send
-    single_leader ... ✅
+The following set of actions must preserve the invariant and successfully terminate:
   recv
     single_leader ... ❌
+      Counterexample (WP):
+        Pre-state:
+          leader = [1]
+          pending = [[0, 0], [0, 1], [1, 0], [1, 1]]
+        Action: recv(n=0, next=1, sender=0)
+      Counterexample (TR):
+        Pre-state:
+          leader = [0]
+          pending = [[0, 0], [0, 1], [1, 0], [1, 1]]
+        Action: recv(n=1, next=0, sender=1)
+        Post-state:
+          leader = [0, 1]
+          pending = [[0, 0], [0, 1], [1, 0], [1, 1]]
+  send
+    single_leader ... ✅
 
-Counter-examples
-================
-
-recv_single_leader:
-interpreted sort Bool
-sort node = #[node0, node1]
-n = node0
-next = node1
-sender = node0
-st.leader(node1) = true
-st.pending(node0, node0) = true
-st'.leader(node0) = true
-st'.leader(node1) = true
-tot.le(node0, node0) = true
-tot.le(node1, node0) = true
-tot.le(node1, node1) = true
+(We recommend you use the infoview widget, which is much easier to read than
+the textual output.)
 
 This is a counterexample to induction (CTI). It shows a pre-state (`st`) that
 satisfies the inductive invariant, and a post-state (`st'`) which is reached
@@ -303,104 +336,37 @@ We can repeat this process until we eliminate all CTIs and thus find an
 inductive invariant that establishes the safety of the system.
 -/
 
-/- TIP: you can run `#check_invariants!` to see the theorem statements that
-couldn't be proven. In this case: -/
--- #check_invariants!
-@[invProof]
-  theorem recv_single_leader_ :
-      ∀ (st st' : @State node),
-        (@System node node_dec node_ne tot btwn).assumptions st →
-          (@System node node_dec node_ne tot btwn).inv st →
-            (@Ring.recv.tr node node_dec node_ne tot btwn) st st' →
-              (@Ring.single_leader node node_dec node_ne tot btwn) st' :=
-    by (unhygienic intros); solve_clause[Ring.recv.tr] Ring.single_leader
+#check_invariants
 
-/- TIP: `#check_invariants?` will print all theorems that will be checked. -/
--- #check_invariants?
-
-/- Veil also provides facilities for interactively proving the safety of state
-transition systems, as shown below: -/
-
-prove_inv_init by { simp_all [initSimp, actSimp, invSimp] }
-
-prove_inv_safe by {
-  sdestruct st;
-  simp [invSimp]
-}
-
-/- We support proof reconstruction from SMT proofs (powered by `lean-smt`). This
-is not yet fully reliable, but it suffices for this simple example. Note that
-`prove_inv_inductive` shows no warning about `sorry` with the option enabled. -/
-set_option veil.smt.reconstructProofs true
-
-prove_inv_inductive by {
-  constructor
-  . apply inv_init
-  intro st st' has hinv hnext
-  sts_induction <;> sdestruct_goal <;> solve_clause
-}
-
-/- We also support bounded model checking to validate the protocol. We use this
-especially to validate that our protocol specifications are non-vacuous, i.e.
-they do actually admit interesting executions. -/
-
-/- This checks that there exists an initial state. -/
-sat trace [initial_state] {} by { bmc_sat }
-
-/- A trace specification consists of:
-- `sat`/`unsat` -- is the trace satisfiable?
-- `[an_optional_name]` -- the name of the trace; can be omitted
-- `{ ... }` -- the trace specification, consisting of:
-  - a sequence of actions, either explicitly listed or using `any action` or
-    `any N actions`
-  - `assert` statements to be checked against the state at that point in the
-    trace
-- `by bmc_sat / bmc ` -- the proof
-
-TIP: you can put your cursor after `by` to see the Lean proof obligation that is
-automatically discharged.
--/
-sat trace [three_nodes_can_elect_leader] {
-  assert (∃ (n1 n2 n3 : node), n1 ≠ n2 ∧ n1 ≠ n3 ∧ n2 ≠ n3)
-  send
-  recv
-  recv
-  recv
-  assert (∃ n, leader n)
-} by { bmc_sat }
-
-sat trace {
-  send
-  assert (∃ n next, pending n next)
-} by { bmc_sat }
-
-
-sat trace [can_elect_leader_explicit] {
-  send
-  assert (∃ n next, pending n next)
-  recv
-  recv
-  assert (∃ l, leader l)
-} by { bmc_sat }
-
-sat trace [can_elect_leader] {
-  any 3 actions
-  assert (∃ l, leader l)
-} by { bmc_sat }
-
-unsat trace {
-  send
-  assert (¬ ∃ n next, pending n next)
-} by { bmc }
-
-sat trace {
-  send
-  assert (∃ n next, pending n next)
-} by { bmc_sat }
-
-unsat trace [trace_any] {
-  any 6 actions
-  assert ¬ (leader L → le N L)
-} by { bmc }
+/- TIP: you can run Cmd+Click (weakest-precondition style VCs) or
+Cmd+Shift+Click (TR-style VCs) to see the theorem statements that couldn't be
+proven. In this case: -/
+theorem recv_single_leader (ρ : Type) (σ : Type) (node : Type) [node_dec_eq : DecidableEq.{1} node]
+    [node_inhabited : Inhabited.{1} node] [tot : TotalOrder node] [btwn : Between node] (χ : State.Label → Type)
+    [χ_rep :
+      ∀ __veil_f,
+        Veil.FieldRepresentation (State.Label.toDomain node __veil_f) (State.Label.toCodomain node __veil_f)
+          (χ __veil_f)]
+    [χ_rep_lawful :
+      ∀ __veil_f,
+        Veil.LawfulFieldRepresentation (State.Label.toDomain node __veil_f) (State.Label.toCodomain node __veil_f)
+          (χ __veil_f) (χ_rep __veil_f)]
+    [σ_sub : IsSubStateOf (@State χ) σ] [ρ_sub : IsSubReaderOf (@Theory node) ρ]
+    [recv_dec_0 :
+      (n next : node) →
+        Decidable
+          (∀ (Z : node),
+            And (Not (@Eq.{1} node n next)) (And (@Ne.{1} node Z n) (@Ne.{1} node Z next) → @btw node btwn n next Z))]
+    [recv_dec_1 : (sender n : node) → Decidable (@le node tot n sender)] :
+    ∀ (sender : node) (n : node) (next : node),
+      Veil.VeilM.meetsSpecificationIfSuccessfulAssuming
+        (@recv.ext ρ σ node node_dec_eq node_inhabited tot btwn χ χ_rep χ_rep_lawful σ_sub ρ_sub recv_dec_0 recv_dec_1
+          sender n next)
+        (@Assumptions ρ node node_dec_eq node_inhabited tot btwn ρ_sub)
+        (@Invariants ρ σ node node_dec_eq node_inhabited tot btwn χ χ_rep χ_rep_lawful σ_sub ρ_sub)
+        (@single_leader ρ σ node node_dec_eq node_inhabited tot btwn χ χ_rep χ_rep_lawful σ_sub ρ_sub) :=
+  by
+  veil_human
+  sorry
 
 end Ring
